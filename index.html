@@ -28,11 +28,13 @@
     .footer{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:14px}
     .btn{border:1px solid var(--border);background:#0e1016;color:#fff;padding:8px 12px;border-radius:10px;cursor:pointer}
     .btn[disabled]{opacity:.5;cursor:not-allowed}
-    .count{color:var(--muted);font-size:13px}
+    .count{color:#9aa0a6;font-size:13px}
     .err{background:#2b1b1b;border:1px solid #553333;color:#f7dddd;padding:10px;border-radius:10px;margin:12px 0}
     .empty{color:#d0d0d0;text-align:center;padding:40px 0}
     .live{display:inline-block;width:8px;height:8px;border-radius:50%;background:#444;margin-left:8px;vertical-align:middle}
     .live.on{background:#62d2a2;box-shadow:0 0 0 4px rgba(98,210,162,.15)}
+    .spin{display:inline-block;width:14px;height:14px;border-radius:50%;border:2px solid #3a3d46;border-top-color:#62d2a2;animation:sp 1s linear infinite;margin-left:8px;vertical-align:middle}
+    @keyframes sp{to{transform:rotate(360deg)}}
     @media (max-width:560px){ .card{grid-template-columns:1fr} .thumb{display:none} .title{font-size:16px} }
   </style>
 </head>
@@ -60,85 +62,59 @@
 
 <script>
 /*** CONFIG ***/
-const COUCH_URL  = 'https://couch.techstudy.me';   // CouchDB base
-const DB_NAME    = 'condolence';                   // DB name
-const PAGE_SIZE  = 20;
-const ENABLE_LIVE = true;                          // turn off to disable live updates
+const COUCH_URL   = 'https://couch.techstudy.me'; // CouchDB base (no trailing slash)
+const DB_NAME     = 'condolence';
+const PAGE_SIZE   = 20;
+const ENABLE_LIVE = true;
 
 /*** UTIL ***/
 const $ = s => document.querySelector(s);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-function toDate(v){
-  if (!v) return null;
-  if (v instanceof Date) return v;
-  if (typeof v === 'number') return new Date(v*1000);
-  const t = Date.parse(v);
-  return isNaN(t) ? null : new Date(t);
-}
-function safeHost(u){
-  try { return new URL(u).hostname; } catch { return ''; }
-}
-function fmtPub(iso){
-  const d = toDate(iso);
-  return d ? d.toLocaleDateString(undefined,{year:'numeric',month:'short',day:'2-digit'}) : '—';
-}
-function fmtSeen(ts){
-  const d = toDate(Number(ts));
-  return d ? d.toLocaleString(undefined,{year:'numeric',month:'short',day:'2-digit',hour:'2-digit',minute:'2-digit'}) : '—';
-}
-function highlight(t=''){
-  return t
-    .replace(/(condol[a-z]*|demise[a-z]*)/gi, m => `<mark>${m}</mark>`)
-    .replace(/(death|deceased)/gi, m => `<mark>${m}</mark>`);
-}
-function cleanPat(p=''){
-  // remove \b and non-capturing bits from pattern strings
-  return p.replace(/\\b/g,'').replace(/\(\?:/g,'(').replace(/\)/g,')');
-}
+function toDate(v){ if(!v) return null; if(v instanceof Date) return v; if(typeof v==='number') return new Date(v*1000); const t=Date.parse(v); return isNaN(t)?null:new Date(t); }
+function safeHost(u){ try{ return new URL(u).hostname }catch{ return '' } }
+function fmtPub(iso){ const d = toDate(iso); return d ? d.toLocaleDateString(undefined,{year:'numeric',month:'short',day:'2-digit'}) : '—'; }
+function fmtSeen(ts){ const d = toDate(Number(ts)); return d ? d.toLocaleString(undefined,{year:'numeric',month:'short',day:'2-digit',hour:'2-digit',minute:'2-digit'}) : '—'; }
+function highlight(t=''){ return t.replace(/(condol[a-z]*|demise[a-z]*)/gi,m=>`<mark>${m}</mark>`).replace(/(death|deceased)/gi,m=>`<mark>${m}</mark>`); }
+function cleanPat(p=''){ return p.replace(/\\b/g,'').replace(/\(\?:/g,'(').replace(/\)/g,')'); }
+const base = () => COUCH_URL.replace(/\/$/,'');
 
 /*** STATE ***/
 let STORE = new Map();  // id -> doc
-let DATA  = [];         // sorted array
+let DATA  = [];
 let PAGE  = 1;
 let currentQuery = '';
 let liveToken = 0;
 
 /*** COUCH HELPERS ***/
-const base = () => COUCH_URL.replace(/\/$/,'');
 function findBody(q){
-  const selector = {"matched_patterns": {"$exists": true}};
-  if (q){
+  const selector = {"matched_patterns":{"$exists":true}};
+  if(q){
     selector["$or"] = [
       {"title":{"$regex":`(?i)${q}`}},
       {"snippet":{"$regex":`(?i)${q}`}},
       {"context_snippet":{"$regex":`(?i)${q}`}}
     ];
   }
-  // prefer published desc, then first_seen_ts desc
-  return { selector, limit: 1000, sort: [{"published":"desc"},{"first_seen_ts":"desc"}] };
+  return {selector, limit:1000, sort:[{"published":"desc"},{"first_seen_ts":"desc"}]};
 }
+
 async function initialDocs(q){
   const res = await fetch(`${base()}/${DB_NAME}/_find`, {
     method:'POST',
     headers:{'Content-Type':'application/json'},
-    body: JSON.stringify(findBody(q))
+    body: JSON.stringify(findBody(q)),
+    mode: 'cors'
   });
-  if (!res.ok) throw new Error(`CouchDB _find ${res.status}`);
+  if(!res.ok){
+    const msg = await res.text().catch(()=> '');
+    throw new Error(`CouchDB _find ${res.status} ${msg.slice(0,180)}`);
+  }
   const js = await res.json();
   return js.docs || [];
 }
-async function fallbackDocs(){
-  const res = await fetch('data.json');
-  if(!res.ok) throw new Error('No data.json');
-  const js = await res.json();
-  return js.docs || js;
-}
 
 /*** UPSERT + SORT ***/
-function keyOf(d){
-  // prefer Couch _id, then canonical URL, then a fallback random key
-  return d._id || d.url || `k_${Math.random().toString(36).slice(2)}`;
-}
+function keyOf(d){ return d._id || d.url || `k_${Math.random().toString(36).slice(2)}`; }
 function upsert(d){ STORE.set(keyOf(d), d); }
 function rebuild(){
   DATA = [...STORE.values()].sort((a,b)=>{
@@ -155,16 +131,16 @@ function render(){
   const list = $('#list');
   list.innerHTML = '';
 
-  if (!items.length){
+  if(!items.length){
     list.innerHTML = `<div class="empty">No items found. Try a broader search.</div>`;
-  } else {
-    for (const d of items){
+  }else{
+    for(const d of items){
       const url   = d.url || '#';
       const title = d.title || '(untitled)';
       const site  = d.site || safeHost(url);
       const pub   = fmtPub(d.published);
       const seen  = fmtSeen(d.first_seen_ts || d.last_seen_ts);
-      const pats  = (d.matched_patterns || []).map(cleanPat).join(', ');
+      const pats  = (d.matched_patterns||[]).map(cleanPat).join(', ');
       const snip  = (d.snippet || d.context_snippet || '').toString().trim();
       const img   = d.image || '';
 
@@ -186,78 +162,78 @@ function render(){
     }
   }
 
-  const pages = Math.max(1, Math.ceil(DATA.length / PAGE_SIZE));
+  const pages = Math.max(1, Math.ceil(DATA.length/PAGE_SIZE));
   $('#count').textContent = `${DATA.length} item${DATA.length!==1?'s':''} • page ${PAGE} of ${pages}`;
   $('#prev').disabled = PAGE<=1;
   $('#next').disabled = PAGE>=pages;
 }
 
-/*** LIVE CHANGES (long-poll using _selector filter) ***/
+/*** LIVE CHANGES ***/
 async function watchChanges(q){
-  if (!ENABLE_LIVE) return;
+  if(!ENABLE_LIVE) return;
   const token = ++liveToken;
   $('#live').classList.remove('on');
 
   let since = 'now';
   const selector = findBody(q).selector;
 
-  while (token === liveToken){
+  while(token === liveToken){
     try{
       const url = `${base()}/${DB_NAME}/_changes?feed=longpoll&since=${encodeURIComponent(since)}&timeout=60000&include_docs=true&filter=_selector`;
-      const res = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({selector})});
-      if (!res.ok) throw new Error(`changes ${res.status}`);
+      const res = await fetch(url, {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({selector}),
+        mode: 'cors'
+      });
+      if(!res.ok) throw new Error(`changes ${res.status}`);
       const data = await res.json();
 
-      for (const ch of (data.results||[])){
-        if (ch.doc && ch.doc.matched_patterns) upsert(ch.doc);
-      }
-      if ((data.results||[]).length){
+      (data.results||[]).forEach(ch => {
+        if(ch.doc && ch.doc.matched_patterns) upsert(ch.doc);
+      });
+
+      if((data.results||[]).length){
         rebuild();
         render();
       }
       since = data.last_seq || since;
       $('#live').classList.add('on');
-    } catch(e){
+    }catch(e){
       $('#live').classList.remove('on');
-      await sleep(2000); // brief backoff then retry
+      await sleep(2000);
     }
   }
 }
 
 /*** LOAD orchestrator ***/
 async function load(q){
-  $('#errors').innerHTML = '';
   PAGE = 1;
   currentQuery = (q||'').trim();
   STORE.clear(); DATA = [];
+  $('#errors').innerHTML = `<div class="count">Loading<span class="spin"></span></div>`;
 
   try{
-    let docs;
-    try{
-      docs = await initialDocs(currentQuery);
-      watchChanges(currentQuery);     // start live listener for this query
-    }catch(err){
-      liveToken++;                    // cancel any live watcher
-      docs = await fallbackDocs();    // file fallback
-      if (currentQuery){
-        const re = new RegExp(currentQuery, 'i');
-        docs = docs.filter(d => re.test(d.title||'') || re.test(d.snippet||'') || re.test(d.context_snippet||''));
-      }
-      $('#errors').innerHTML = `<div class="err">Using <b>data.json</b> fallback (CouchDB not reachable). ${err.message||err}</div>`;
-    }
-
+    const docs = await initialDocs(currentQuery);
+    $('#errors').innerHTML = '';
     docs.forEach(upsert);
     rebuild();
     render();
+    watchChanges(currentQuery);
   }catch(err){
-    $('#errors').innerHTML = `<div class="err">Failed to load data: ${err.message||err}</div>`;
+    $('#errors').innerHTML =
+      `<div class="err">
+        Failed to load from CouchDB. ${err.message||err}<br/>
+        Tips: confirm CORS allows <b>https://vikssarate.github.io</b> and the DB <b>${DB_NAME}</b> is public (no admins/members).
+      </div>`;
+    $('#list').innerHTML = '';
+    $('#count').textContent = '—';
   }
 }
 
 /*** EVENTS ***/
 $('#prev').addEventListener('click', ()=>{ if(PAGE>1){ PAGE--; render(); }});
 $('#next').addEventListener('click', ()=>{ const max=Math.ceil(DATA.length/PAGE_SIZE)||1; if(PAGE<max){ PAGE++; render(); }});
-
 let t=null;
 $('#q').addEventListener('input', e=>{
   clearTimeout(t);
@@ -265,7 +241,7 @@ $('#q').addEventListener('input', e=>{
 });
 
 /*** START ***/
-load();  // initial load
+load();
 </script>
 </body>
 </html>
