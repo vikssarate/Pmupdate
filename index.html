@@ -30,7 +30,7 @@
     .btn[disabled]{opacity:.5;cursor:not-allowed}
     .count{color:var(--muted);font-size:13px}
     .err{background:#2b1b1b;border:1px solid #553333;color:#f7dddd;padding:10px;border-radius:10px;margin:12px 0}
-    .empty{color:var(--muted);text-align:center;padding:40px 0}
+    .empty{color:#d0d0d0;text-align:center;padding:40px 0}
     .live{display:inline-block;width:8px;height:8px;border-radius:50%;background:#444;margin-left:8px;vertical-align:middle}
     .live.on{background:#62d2a2;box-shadow:0 0 0 4px rgba(98,210,162,.15)}
     @media (max-width:560px){ .card{grid-template-columns:1fr} .thumb{display:none} .title{font-size:16px} }
@@ -60,91 +60,90 @@
 
 <script>
 /*** CONFIG ***/
-const COUCH_URL = 'https://couch.techstudy.me';  // public CouchDB base
-const DB_NAME   = 'condolence';                  // database name
-const PAGE_SIZE = 20;
-const ENABLE_LIVE = true;                        // turn off to disable live updates
+const COUCH_URL  = 'https://couch.techstudy.me';   // CouchDB base
+const DB_NAME    = 'condolence';                   // DB name
+const PAGE_SIZE  = 20;
+const ENABLE_LIVE = true;                          // turn off to disable live updates
 
 /*** UTIL ***/
-const $ = sel => document.querySelector(sel);
+const $ = s => document.querySelector(s);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-function qs(obj){ return new URLSearchParams(obj).toString(); }
-function toDate(d) {
-  // accepts ISO string 'YYYY-MM-DD' or number/Date
-  if (!d) return null;
-  if (typeof d === 'string') {
-    const t = Date.parse(d);
-    if (!isNaN(t)) return new Date(t);
-  }
-  if (typeof d === 'number') return new Date(d*1000);
-  if (d instanceof Date) return d;
-  return null;
+function toDate(v){
+  if (!v) return null;
+  if (v instanceof Date) return v;
+  if (typeof v === 'number') return new Date(v*1000);
+  const t = Date.parse(v);
+  return isNaN(t) ? null : new Date(t);
 }
-function niceDateISO(iso){
-  if(!iso) return '—';
+function safeHost(u){
+  try { return new URL(u).hostname; } catch { return ''; }
+}
+function fmtPub(iso){
   const d = toDate(iso);
-  return d ? d.toLocaleString(undefined,{year:'numeric',month:'short',day:'2-digit'}) : '—';
+  return d ? d.toLocaleDateString(undefined,{year:'numeric',month:'short',day:'2-digit'}) : '—';
 }
-function niceSeen(ts){
-  if(!ts) return '—';
-  const d = new Date(Number(ts)*1000);
-  return d.toLocaleString(undefined,{year:'numeric',month:'short',day:'2-digit',hour:'2-digit',minute:'2-digit'});
+function fmtSeen(ts){
+  const d = toDate(Number(ts));
+  return d ? d.toLocaleString(undefined,{year:'numeric',month:'short',day:'2-digit',hour:'2-digit',minute:'2-digit'}) : '—';
 }
-function highlight(text){
-  if(!text) return '';
-  return text
+function highlight(t=''){
+  return t
     .replace(/(condol[a-z]*|demise[a-z]*)/gi, m => `<mark>${m}</mark>`)
     .replace(/(death|deceased)/gi, m => `<mark>${m}</mark>`);
 }
-// stable join of arrays/strings for search
-function rd(v){ return (v||'').toString().replace(/\s+/g,' ').trim(); }
+function cleanPat(p=''){
+  // remove \b and non-capturing bits from pattern strings
+  return p.replace(/\\b/g,'').replace(/\(\?:/g,'(').replace(/\)/g,')');
+}
 
-/*** DATA STATE ***/
-let STORE = new Map();     // _id -> doc
-let DATA  = [];            // sorted array
+/*** STATE ***/
+let STORE = new Map();  // id -> doc
+let DATA  = [];         // sorted array
 let PAGE  = 1;
 let currentQuery = '';
-let liveToken = 0;         // cancels previous watch loop
+let liveToken = 0;
 
 /*** COUCH HELPERS ***/
-function base(){ return COUCH_URL.replace(/\/$/,''); }
-function couchFindBody(q){
+const base = () => COUCH_URL.replace(/\/$/,'');
+function findBody(q){
   const selector = {"matched_patterns": {"$exists": true}};
-  if (q) {
-    // search title/snippet (support both 'snippet' and 'context_snippet')
+  if (q){
     selector["$or"] = [
-      {"title"           : {"$regex": `(?i)${q}`}},
-      {"snippet"         : {"$regex": `(?i)${q}`}},
-      {"context_snippet" : {"$regex": `(?i)${q}`}}
+      {"title":{"$regex":`(?i)${q}`}},
+      {"snippet":{"$regex":`(?i)${q}`}},
+      {"context_snippet":{"$regex":`(?i)${q}`}}
     ];
   }
-  return {selector, limit: 1000, sort: [{"published":"desc"}]};
+  // prefer published desc, then first_seen_ts desc
+  return { selector, limit: 1000, sort: [{"published":"desc"},{"first_seen_ts":"desc"}] };
 }
-
-async function fetchInitialFromCouch(q){
-  const url  = `${base()}/${DB_NAME}/_find`;
-  const body = couchFindBody(q);
-  const res  = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
-  if(!res.ok) throw new Error(`CouchDB _find ${res.status}`);
-  const json = await res.json();
-  return json.docs || [];
+async function initialDocs(q){
+  const res = await fetch(`${base()}/${DB_NAME}/_find`, {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(findBody(q))
+  });
+  if (!res.ok) throw new Error(`CouchDB _find ${res.status}`);
+  const js = await res.json();
+  return js.docs || [];
 }
-
-async function fetchFileFallback(){
+async function fallbackDocs(){
   const res = await fetch('data.json');
   if(!res.ok) throw new Error('No data.json');
-  const json = await res.json();
-  return json.docs || json;
+  const js = await res.json();
+  return js.docs || js;
 }
 
-function upsert(doc){
-  STORE.set(doc._id || doc.url || Math.random().toString(36), doc);
+/*** UPSERT + SORT ***/
+function keyOf(d){
+  // prefer Couch _id, then canonical URL, then a fallback random key
+  return d._id || d.url || `k_${Math.random().toString(36).slice(2)}`;
 }
+function upsert(d){ STORE.set(keyOf(d), d); }
 function rebuild(){
   DATA = [...STORE.values()].sort((a,b)=>{
-    // prefer published (ISO), fallback to first_seen_ts
-    const ad = toDate(a.published) || new Date((a.first_seen_ts||0)*1000);
-    const bd = toDate(b.published) || new Date((b.first_seen_ts||0)*1000);
+    const ad = toDate(a.published) || toDate(a.first_seen_ts) || new Date(0);
+    const bd = toDate(b.published) || toDate(b.first_seen_ts) || new Date(0);
     return bd - ad;
   });
 }
@@ -152,85 +151,75 @@ function rebuild(){
 /*** RENDER ***/
 function render(){
   const start = (PAGE-1)*PAGE_SIZE;
-  const pageItems = DATA.slice(start, start+PAGE_SIZE);
+  const items = DATA.slice(start, start+PAGE_SIZE);
   const list = $('#list');
   list.innerHTML = '';
 
-  if(pageItems.length === 0){
-    list.innerHTML = `<div class="empty">No items found.</div>`;
+  if (!items.length){
+    list.innerHTML = `<div class="empty">No items found. Try a broader search.</div>`;
   } else {
-    for(const d of pageItems){
-      const url     = d.url || '#';
-      const title   = d.title || '(untitled)';
-      const site    = d.site || (url!=='#' ? new URL(url).hostname : '');
-      const whenPub = niceDateISO(d.published);
-      const whenSeen= niceSeen(d.first_seen_ts || d.last_seen_ts);
-      const pats    = (d.matched_patterns || []).map(s => s.replace(/\\b/g,'').replace(/\(\?\:|\)/g,'')).join(', ');
-      const snippet = rd(d.snippet || d.context_snippet);
-      const img     = d.image || '';
+    for (const d of items){
+      const url   = d.url || '#';
+      const title = d.title || '(untitled)';
+      const site  = d.site || safeHost(url);
+      const pub   = fmtPub(d.published);
+      const seen  = fmtSeen(d.first_seen_ts || d.last_seen_ts);
+      const pats  = (d.matched_patterns || []).map(cleanPat).join(', ');
+      const snip  = (d.snippet || d.context_snippet || '').toString().trim();
+      const img   = d.image || '';
 
       list.insertAdjacentHTML('beforeend', `
-        <article class="card ${img? '' : 'noimg'}" data-id="${d._id||''}">
+        <article class="card ${img? '' : 'noimg'}">
           ${img ? `<img class="thumb" loading="lazy" src="${img}" alt="">` : ``}
           <div>
             <h2 class="title"><a target="_blank" rel="noopener" href="${url}">${highlight(title)}</a></h2>
             <div class="meta">
-              ${whenPub!=='—' ? `<span>Published: ${whenPub}</span>` : ``}
-              ${whenSeen!=='—' ? `<span>Seen: ${whenSeen}</span>` : ``}
-              ${site ? `<span>Site: ${site}</span>` : ``}
-              ${pats ? `<span>Matched: ${pats}</span>` : ``}
+              ${pub  !=='—' ? `<span>Published: ${pub}</span>` : ``}
+              ${seen !=='—' ? `<span>Seen: ${seen}</span>` : ``}
+              ${site        ? `<span>Site: ${site}</span>` : ``}
+              ${pats        ? `<span>Matched: ${pats}</span>` : ``}
             </div>
-            ${snippet ? `<div class="snippet">${highlight(snippet)}</div>` : ``}
+            ${snip ? `<div class="snippet">${highlight(snip)}</div>` : ``}
           </div>
         </article>
       `);
     }
   }
 
-  // footer
-  $('#count').textContent =
-    `${DATA.length} item${DATA.length!==1?'s':''} • page ${PAGE} of ${Math.max(1, Math.ceil(DATA.length/PAGE_SIZE))}`;
+  const pages = Math.max(1, Math.ceil(DATA.length / PAGE_SIZE));
+  $('#count').textContent = `${DATA.length} item${DATA.length!==1?'s':''} • page ${PAGE} of ${pages}`;
   $('#prev').disabled = PAGE<=1;
-  $('#next').disabled = PAGE>=Math.ceil(DATA.length/PAGE_SIZE);
+  $('#next').disabled = PAGE>=pages;
 }
 
-/*** LIVE CHANGES (long-poll) ***/
+/*** LIVE CHANGES (long-poll using _selector filter) ***/
 async function watchChanges(q){
   if (!ENABLE_LIVE) return;
-  const myToken = ++liveToken;
+  const token = ++liveToken;
   $('#live').classList.remove('on');
 
-  // Mango selector filter for _changes
-  const selector = couchFindBody(q).selector;
   let since = 'now';
+  const selector = findBody(q).selector;
 
-  while (myToken === liveToken) {
+  while (token === liveToken){
     try{
       const url = `${base()}/${DB_NAME}/_changes?feed=longpoll&since=${encodeURIComponent(since)}&timeout=60000&include_docs=true&filter=_selector`;
-      const res = await fetch(url, {
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({selector})
-      });
-      if(!res.ok) throw new Error(`changes ${res.status}`);
+      const res = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({selector})});
+      if (!res.ok) throw new Error(`changes ${res.status}`);
       const data = await res.json();
 
-      (data.results || []).forEach(ch => {
-        if (ch.doc && ch.doc.matched_patterns) {
-          upsert(ch.doc);
-        }
-      });
-      since = data.last_seq || since;
-      if ((data.results || []).length) {
+      for (const ch of (data.results||[])){
+        if (ch.doc && ch.doc.matched_patterns) upsert(ch.doc);
+      }
+      if ((data.results||[]).length){
         rebuild();
-        // keep current page visible, but push new items to the front
         render();
       }
+      since = data.last_seq || since;
       $('#live').classList.add('on');
-    }catch(err){
-      // transient error – backoff then retry
+    } catch(e){
       $('#live').classList.remove('on');
-      await sleep(2000);
+      await sleep(2000); // brief backoff then retry
     }
   }
 }
@@ -239,27 +228,25 @@ async function watchChanges(q){
 async function load(q){
   $('#errors').innerHTML = '';
   PAGE = 1;
-  currentQuery = q || '';
+  currentQuery = (q||'').trim();
   STORE.clear(); DATA = [];
 
   try{
     let docs;
-    try {
-      docs = await fetchInitialFromCouch(currentQuery);
-      // start live watcher bound to this query
-      watchChanges(currentQuery);
-    } catch (e) {
-      // CouchDB failed (CORS/auth/offline) → try local file as fallback and stop live watcher
-      liveToken++; // cancel any watcher
-      docs = await fetchFileFallback();
-      if(currentQuery){
+    try{
+      docs = await initialDocs(currentQuery);
+      watchChanges(currentQuery);     // start live listener for this query
+    }catch(err){
+      liveToken++;                    // cancel any live watcher
+      docs = await fallbackDocs();    // file fallback
+      if (currentQuery){
         const re = new RegExp(currentQuery, 'i');
         docs = docs.filter(d => re.test(d.title||'') || re.test(d.snippet||'') || re.test(d.context_snippet||''));
       }
-      $('#errors').innerHTML = `<div class="err">Using <b>data.json</b> fallback (CouchDB not reachable). ${e.message || e}</div>`;
+      $('#errors').innerHTML = `<div class="err">Using <b>data.json</b> fallback (CouchDB not reachable). ${err.message||err}</div>`;
     }
 
-    (docs||[]).forEach(upsert);
+    docs.forEach(upsert);
     rebuild();
     render();
   }catch(err){
@@ -268,19 +255,17 @@ async function load(q){
 }
 
 /*** EVENTS ***/
-$('#prev').addEventListener('click', ()=>{ if(PAGE>1){ PAGE--; render(); } });
+$('#prev').addEventListener('click', ()=>{ if(PAGE>1){ PAGE--; render(); }});
 $('#next').addEventListener('click', ()=>{ const max=Math.ceil(DATA.length/PAGE_SIZE)||1; if(PAGE<max){ PAGE++; render(); }});
 
-// debounced search
 let t=null;
-$('#q').addEventListener('input', (e)=>{
-  const v = e.target.value.trim();
+$('#q').addEventListener('input', e=>{
   clearTimeout(t);
-  t = setTimeout(()=> load(v), 300);
+  t = setTimeout(()=> load(e.target.value), 300);
 });
 
 /*** START ***/
-load(); // initial load
+load();  // initial load
 </script>
 </body>
 </html>
