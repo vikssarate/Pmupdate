@@ -6,17 +6,22 @@
   <title>Condolence | PM/GoI News Monitor</title>
   <style>
     :root { --bg:#0b0c10; --card:#111218; --ink:#e6e6e6; --muted:#9aa0a6; --accent:#62d2a2; --border:#2a2d36; }
-    *{box-sizing:border-box} body{margin:0;font:16px/1.5 system-ui,Segoe UI,Roboto,Helvetica,Arial;background:var(--bg);color:var(--ink)}
+    *{box-sizing:border-box}
+    body{margin:0;font:16px/1.5 system-ui,Segoe UI,Roboto,Helvetica,Arial;background:var(--bg);color:var(--ink)}
     header{padding:20px 16px;border-bottom:1px solid var(--border);position:sticky;top:0;background:linear-gradient(180deg,var(--bg) 0%,rgba(11,12,16,.9) 100%);backdrop-filter:blur(6px);z-index:1}
-    h1{margin:0;font-size:20px} .sub{color:var(--muted);font-size:13px}
+    h1{margin:0;font-size:20px}
+    .sub{color:var(--muted);font-size:13px}
     .bar{display:flex;gap:10px;margin-top:10px;flex-wrap:wrap}
     input[type=search]{flex:1;min-width:240px;padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:#0e1016;color:#fff;outline:none}
     .pill{padding:8px 12px;border:1px solid var(--border);border-radius:999px;color:#fff;text-decoration:none}
     .pill.active{background:var(--accent);border-color:transparent;color:#07120e;font-weight:600}
     main{max-width:960px;margin:22px auto;padding:0 16px}
-    .card{border:1px solid var(--border);background:var(--card);border-radius:14px;padding:16px;margin:12px 0}
+    .card{border:1px solid var(--border);background:var(--card);border-radius:14px;padding:16px;margin:12px 0;display:grid;grid-template-columns:112px 1fr;gap:14px}
+    .card.noimg{grid-template-columns:1fr}
+    .thumb{width:112px;height:84px;border-radius:10px;object-fit:cover;border:1px solid var(--border);background:#0e1016}
     .title{font-weight:700;font-size:18px;margin:0 0 6px}
-    .title a{color:#fff;text-decoration:none} .title a:hover{color:var(--accent)}
+    .title a{color:#fff;text-decoration:none}
+    .title a:hover{color:var(--accent)}
     .meta{font-size:13px;color:var(--muted);display:flex;gap:10px;flex-wrap:wrap}
     .snippet{margin-top:8px;color:#d0d0d0}
     mark{background:transparent;color:var(--accent);font-weight:700}
@@ -26,12 +31,14 @@
     .count{color:var(--muted);font-size:13px}
     .err{background:#2b1b1b;border:1px solid #553333;color:#f7dddd;padding:10px;border-radius:10px;margin:12px 0}
     .empty{color:var(--muted);text-align:center;padding:40px 0}
-    @media (max-width:480px){ .title{font-size:16px} }
+    .live{display:inline-block;width:8px;height:8px;border-radius:50%;background:#444;margin-left:8px;vertical-align:middle}
+    .live.on{background:#62d2a2;box-shadow:0 0 0 4px rgba(98,210,162,.15)}
+    @media (max-width:560px){ .card{grid-template-columns:1fr} .thumb{display:none} .title{font-size:16px} }
   </style>
 </head>
 <body>
 <header>
-  <h1>Condolence</h1>
+  <h1>Condolence <span id="live" class="live" title="Live"></span></h1>
   <div class="sub">Live list of <b>condolence/demise</b> items your scraper saved in CouchDB.</div>
   <div class="bar">
     <input id="q" type="search" placeholder="Search title or text… (e.g. Philippines, Chennai)"/>
@@ -53,14 +60,32 @@
 
 <script>
 /*** CONFIG ***/
-const COUCH_URL = 'https://couch.techstudy.me'; // <-- change if needed
-const DB_NAME   = 'condolence';                // <-- change if needed
+const COUCH_URL = 'https://couch.techstudy.me';  // public CouchDB base
+const DB_NAME   = 'condolence';                  // database name
 const PAGE_SIZE = 20;
+const ENABLE_LIVE = true;                        // turn off to disable live updates
 
 /*** UTIL ***/
 const $ = sel => document.querySelector(sel);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 function qs(obj){ return new URLSearchParams(obj).toString(); }
-function niceDate(ts){
+function toDate(d) {
+  // accepts ISO string 'YYYY-MM-DD' or number/Date
+  if (!d) return null;
+  if (typeof d === 'string') {
+    const t = Date.parse(d);
+    if (!isNaN(t)) return new Date(t);
+  }
+  if (typeof d === 'number') return new Date(d*1000);
+  if (d instanceof Date) return d;
+  return null;
+}
+function niceDateISO(iso){
+  if(!iso) return '—';
+  const d = toDate(iso);
+  return d ? d.toLocaleString(undefined,{year:'numeric',month:'short',day:'2-digit'}) : '—';
+}
+function niceSeen(ts){
   if(!ts) return '—';
   const d = new Date(Number(ts)*1000);
   return d.toLocaleString(undefined,{year:'numeric',month:'short',day:'2-digit',hour:'2-digit',minute:'2-digit'});
@@ -69,36 +94,62 @@ function highlight(text){
   if(!text) return '';
   return text
     .replace(/(condol[a-z]*|demise[a-z]*)/gi, m => `<mark>${m}</mark>`)
-    .replace(/(death|deceased)/gi, m => `<mark>${m}</mark>`); // ready if you add 'death' later
+    .replace(/(death|deceased)/gi, m => `<mark>${m}</mark>`);
 }
+// stable join of arrays/strings for search
+function rd(v){ return (v||'').toString().replace(/\s+/g,' ').trim(); }
 
-/*** DATA LOAD (CouchDB -> fallback to data.json) ***/
-async function loadFromCouch(q){
-  const url = `${COUCH_URL.replace(/\/$/,'')}/${DB_NAME}/_find`;
+/*** DATA STATE ***/
+let STORE = new Map();     // _id -> doc
+let DATA  = [];            // sorted array
+let PAGE  = 1;
+let currentQuery = '';
+let liveToken = 0;         // cancels previous watch loop
+
+/*** COUCH HELPERS ***/
+function base(){ return COUCH_URL.replace(/\/$/,''); }
+function couchFindBody(q){
   const selector = {"matched_patterns": {"$exists": true}};
-  if(q){
+  if (q) {
+    // search title/snippet (support both 'snippet' and 'context_snippet')
     selector["$or"] = [
-      {"title":{"$regex":`(?i)${q}`}},
-      {"context_snippet":{"$regex":`(?i)${q}`}}
+      {"title"           : {"$regex": `(?i)${q}`}},
+      {"snippet"         : {"$regex": `(?i)${q}`}},
+      {"context_snippet" : {"$regex": `(?i)${q}`}}
     ];
   }
-  const body = {"selector": selector, "limit": 1000}; // sort client-side
+  return {selector, limit: 1000, sort: [{"published":"desc"}]};
+}
+
+async function fetchInitialFromCouch(q){
+  const url  = `${base()}/${DB_NAME}/_find`;
+  const body = couchFindBody(q);
   const res  = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
-  if(!res.ok) throw new Error(`CouchDB ${res.status}`);
+  if(!res.ok) throw new Error(`CouchDB _find ${res.status}`);
   const json = await res.json();
   return json.docs || [];
 }
 
-async function loadFromFile(){
+async function fetchFileFallback(){
   const res = await fetch('data.json');
   if(!res.ok) throw new Error('No data.json');
   const json = await res.json();
-  return json.docs || json; // support either raw docs array or {docs:[...]}
+  return json.docs || json;
+}
+
+function upsert(doc){
+  STORE.set(doc._id || doc.url || Math.random().toString(36), doc);
+}
+function rebuild(){
+  DATA = [...STORE.values()].sort((a,b)=>{
+    // prefer published (ISO), fallback to first_seen_ts
+    const ad = toDate(a.published) || new Date((a.first_seen_ts||0)*1000);
+    const bd = toDate(b.published) || new Date((b.first_seen_ts||0)*1000);
+    return bd - ad;
+  });
 }
 
 /*** RENDER ***/
-let DATA = [], PAGE = 1;
-
 function render(){
   const start = (PAGE-1)*PAGE_SIZE;
   const pageItems = DATA.slice(start, start+PAGE_SIZE);
@@ -109,58 +160,107 @@ function render(){
     list.innerHTML = `<div class="empty">No items found.</div>`;
   } else {
     for(const d of pageItems){
-      const url = d.url || '#';
-      const title = d.title || '(untitled)';
-      const when = niceDate(d.first_seen_ts || d.last_seen_ts);
-      const site = d.site || new URL(url).hostname;
-      const patterns = (d.matched_patterns || []).map(s => s.replace(/\\b/g,'').replace(/\(\?\:|\)/g,'')).join(', ');
-      const snippet = d.context_snippet || '';
+      const url     = d.url || '#';
+      const title   = d.title || '(untitled)';
+      const site    = d.site || (url!=='#' ? new URL(url).hostname : '');
+      const whenPub = niceDateISO(d.published);
+      const whenSeen= niceSeen(d.first_seen_ts || d.last_seen_ts);
+      const pats    = (d.matched_patterns || []).map(s => s.replace(/\\b/g,'').replace(/\(\?\:|\)/g,'')).join(', ');
+      const snippet = rd(d.snippet || d.context_snippet);
+      const img     = d.image || '';
 
       list.insertAdjacentHTML('beforeend', `
-        <article class="card">
-          <h2 class="title"><a target="_blank" rel="noopener" href="${url}">${highlight(title)}</a></h2>
-          <div class="meta">
-            <span>Seen: ${when}</span>
-            <span>Site: ${site}</span>
-            ${patterns ? `<span>Matched: ${patterns}</span>` : ``}
+        <article class="card ${img? '' : 'noimg'}" data-id="${d._id||''}">
+          ${img ? `<img class="thumb" loading="lazy" src="${img}" alt="">` : ``}
+          <div>
+            <h2 class="title"><a target="_blank" rel="noopener" href="${url}">${highlight(title)}</a></h2>
+            <div class="meta">
+              ${whenPub!=='—' ? `<span>Published: ${whenPub}</span>` : ``}
+              ${whenSeen!=='—' ? `<span>Seen: ${whenSeen}</span>` : ``}
+              ${site ? `<span>Site: ${site}</span>` : ``}
+              ${pats ? `<span>Matched: ${pats}</span>` : ``}
+            </div>
+            ${snippet ? `<div class="snippet">${highlight(snippet)}</div>` : ``}
           </div>
-          ${snippet ? `<div class="snippet">${highlight(snippet)}</div>` : ``}
         </article>
       `);
     }
   }
 
   // footer
-  $('#count').textContent = `${DATA.length} item${DATA.length!==1?'s':''} • page ${PAGE} of ${Math.max(1, Math.ceil(DATA.length/PAGE_SIZE))}`;
+  $('#count').textContent =
+    `${DATA.length} item${DATA.length!==1?'s':''} • page ${PAGE} of ${Math.max(1, Math.ceil(DATA.length/PAGE_SIZE))}`;
   $('#prev').disabled = PAGE<=1;
   $('#next').disabled = PAGE>=Math.ceil(DATA.length/PAGE_SIZE);
 }
 
-function applySearch(q){
-  // we call load() again with q so the CouchDB query filters server-side (and file fallback filters client-side)
-  load(q);
+/*** LIVE CHANGES (long-poll) ***/
+async function watchChanges(q){
+  if (!ENABLE_LIVE) return;
+  const myToken = ++liveToken;
+  $('#live').classList.remove('on');
+
+  // Mango selector filter for _changes
+  const selector = couchFindBody(q).selector;
+  let since = 'now';
+
+  while (myToken === liveToken) {
+    try{
+      const url = `${base()}/${DB_NAME}/_changes?feed=longpoll&since=${encodeURIComponent(since)}&timeout=60000&include_docs=true&filter=_selector`;
+      const res = await fetch(url, {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({selector})
+      });
+      if(!res.ok) throw new Error(`changes ${res.status}`);
+      const data = await res.json();
+
+      (data.results || []).forEach(ch => {
+        if (ch.doc && ch.doc.matched_patterns) {
+          upsert(ch.doc);
+        }
+      });
+      since = data.last_seq || since;
+      if ((data.results || []).length) {
+        rebuild();
+        // keep current page visible, but push new items to the front
+        render();
+      }
+      $('#live').classList.add('on');
+    }catch(err){
+      // transient error – backoff then retry
+      $('#live').classList.remove('on');
+      await sleep(2000);
+    }
+  }
 }
 
 /*** LOAD orchestrator ***/
 async function load(q){
   $('#errors').innerHTML = '';
   PAGE = 1;
+  currentQuery = q || '';
+  STORE.clear(); DATA = [];
+
   try{
     let docs;
     try {
-      docs = await loadFromCouch(q);
+      docs = await fetchInitialFromCouch(currentQuery);
+      // start live watcher bound to this query
+      watchChanges(currentQuery);
     } catch (e) {
-      // CouchDB failed (CORS/auth/offline) → try local file as fallback
-      docs = await loadFromFile();
-      // local file mode: apply client-side search
-      if(q){
-        const re = new RegExp(q, 'i');
-        docs = docs.filter(d => re.test(d.title||'') || re.test(d.context_snippet||''));
+      // CouchDB failed (CORS/auth/offline) → try local file as fallback and stop live watcher
+      liveToken++; // cancel any watcher
+      docs = await fetchFileFallback();
+      if(currentQuery){
+        const re = new RegExp(currentQuery, 'i');
+        docs = docs.filter(d => re.test(d.title||'') || re.test(d.snippet||'') || re.test(d.context_snippet||''));
       }
       $('#errors').innerHTML = `<div class="err">Using <b>data.json</b> fallback (CouchDB not reachable). ${e.message || e}</div>`;
     }
-    // sort newest first
-    DATA = (docs||[]).slice().sort((a,b)=> (b.first_seen_ts||0)-(a.first_seen_ts||0));
+
+    (docs||[]).forEach(upsert);
+    rebuild();
     render();
   }catch(err){
     $('#errors').innerHTML = `<div class="err">Failed to load data: ${err.message||err}</div>`;
@@ -170,7 +270,14 @@ async function load(q){
 /*** EVENTS ***/
 $('#prev').addEventListener('click', ()=>{ if(PAGE>1){ PAGE--; render(); } });
 $('#next').addEventListener('click', ()=>{ const max=Math.ceil(DATA.length/PAGE_SIZE)||1; if(PAGE<max){ PAGE++; render(); }});
-$('#q').addEventListener('input', (e)=>{ const v=e.target.value.trim(); applySearch(v); });
+
+// debounced search
+let t=null;
+$('#q').addEventListener('input', (e)=>{
+  const v = e.target.value.trim();
+  clearTimeout(t);
+  t = setTimeout(()=> load(v), 300);
+});
 
 /*** START ***/
 load(); // initial load
