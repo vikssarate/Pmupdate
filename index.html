@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>Condolence | PM/GoI News Monitor</title>
+  <title>PM/GoI News Monitor</title>
   <style>
     :root { --bg:#0b0c10; --card:#111218; --ink:#e6e6e6; --muted:#9aa0a6; --accent:#62d2a2; --border:#2a2d36; }
     *{box-sizing:border-box}
@@ -11,7 +11,7 @@
     header{padding:20px 16px;border-bottom:1px solid var(--border);position:sticky;top:0;background:linear-gradient(180deg,var(--bg) 0%,rgba(11,12,16,.9) 100%);backdrop-filter:blur(6px);z-index:1}
     h1{margin:0;font-size:20px}
     .sub{color:var(--muted);font-size:13px}
-    .bar{display:flex;gap:10px;margin-top:10px;flex-wrap:wrap}
+    .bar{display:flex;gap:10px;margin-top:10px;flex-wrap:wrap;align-items:center}
     input[type=search]{flex:1;min-width:240px;padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:#0e1016;color:#fff;outline:none}
     .pill{padding:8px 12px;border:1px solid var(--border);border-radius:999px;color:#fff;text-decoration:none}
     .pill.active{background:var(--accent);border-color:transparent;color:#07120e;font-weight:600}
@@ -40,11 +40,12 @@
 </head>
 <body>
 <header>
-  <h1>Condolence <span id="live" class="live" title="Live"></span></h1>
-  <div class="sub">Live list of <b>condolence/demise</b> items your scraper saved in CouchDB.</div>
+  <h1>PM/GoI News Monitor <span id="live" class="live" title="Live"></span></h1>
+  <div class="sub">Live list of items saved in CouchDB. Choose a tab, then search/filter.</div>
   <div class="bar">
     <input id="q" type="search" placeholder="Search title or text… (e.g. Philippines, Chennai)"/>
-    <a class="pill active" href="#">Condolence</a>
+    <a class="pill active" data-tab="condolence" href="#">Condolence</a>
+    <a class="pill" data-tab="obituaries" href="#">Obituaries</a>
   </div>
 </header>
 
@@ -62,8 +63,20 @@
 
 <script>
 /*** CONFIG ***/
-const COUCH_URL   = 'https://couch.techstudy.me'; // CouchDB base (no trailing slash)
-const DB_NAME     = 'condolence';
+const COUCH_URL  = 'https://couch.techstudy.me';  // CouchDB base (no trailing slash)
+const TABS = {
+  condolence: {
+    db: 'condolence',
+    // We only show docs produced by your condolence matchers
+    baseSelector: {"matched_patterns": {"$exists": true}}
+  },
+  obituaries: {
+    db: 'obituaries',
+    // If your obituary spider writes everything to this DB, no extra filter needed.
+    // If you tag docs, e.g. {"category":"obituary"}, set baseSelector: {"category":"obituary"}
+    baseSelector: {}
+  }
+};
 const PAGE_SIZE   = 20;
 const ENABLE_LIVE = true;
 
@@ -74,11 +87,15 @@ function toDate(v){ if(!v) return null; if(v instanceof Date) return v; if(typeo
 function safeHost(u){ try{ return new URL(u).hostname }catch{ return '' } }
 function fmtPub(iso){ const d = toDate(iso); return d ? d.toLocaleDateString(undefined,{year:'numeric',month:'short',day:'2-digit'}) : '—'; }
 function fmtSeen(ts){ const d = toDate(Number(ts)); return d ? d.toLocaleString(undefined,{year:'numeric',month:'short',day:'2-digit',hour:'2-digit',minute:'2-digit'}) : '—'; }
-function highlight(t=''){ return t.replace(/(condol[a-z]*|demise[a-z]*)/gi,m=>`<mark>${m}</mark>`).replace(/(death|deceased)/gi,m=>`<mark>${m}</mark>`); }
+function highlight(t=''){
+  return t
+    .replace(/(condol[a-z]*|demise[a-z]*|death|deceased|loss(?:[-\s]+of)?[-\s]+(?:life|lives)|passes?\s+away)/gi, m=>`<mark>${m}</mark>`);
+}
 function cleanPat(p=''){ return p.replace(/\\b/g,'').replace(/\(\?:/g,'(').replace(/\)/g,')'); }
 const base = () => COUCH_URL.replace(/\/$/,'');
 
 /*** STATE ***/
+let TAB = 'condolence';
 let STORE = new Map();  // id -> doc
 let DATA  = [];
 let PAGE  = 1;
@@ -87,7 +104,8 @@ let liveToken = 0;
 
 /*** COUCH HELPERS ***/
 function findBody(q){
-  const selector = {"matched_patterns":{"$exists":true}};
+  // start with the tab's base selector
+  const selector = JSON.parse(JSON.stringify(TABS[TAB].baseSelector || {}));
   if(q){
     selector["$or"] = [
       {"title":{"$regex":`(?i)${q}`}},
@@ -99,7 +117,8 @@ function findBody(q){
 }
 
 async function initialDocs(q){
-  const res = await fetch(`${base()}/${DB_NAME}/_find`, {
+  const url = `${base()}/${TABS[TAB].db}/_find`;
+  const res = await fetch(url, {
     method:'POST',
     headers:{'Content-Type':'application/json'},
     body: JSON.stringify(findBody(q)),
@@ -163,7 +182,7 @@ function render(){
   }
 
   const pages = Math.max(1, Math.ceil(DATA.length/PAGE_SIZE));
-  $('#count').textContent = `${DATA.length} item${DATA.length!==1?'s':''} • page ${PAGE} of ${pages}`;
+  $('#count').textContent = `${DATA.length} item${DATA.length!==1?'s':''} • page ${PAGE} of ${pages} • DB: ${TABS[TAB].db}`;
   $('#prev').disabled = PAGE<=1;
   $('#next').disabled = PAGE>=pages;
 }
@@ -179,7 +198,7 @@ async function watchChanges(q){
 
   while(token === liveToken){
     try{
-      const url = `${base()}/${DB_NAME}/_changes?feed=longpoll&since=${encodeURIComponent(since)}&timeout=60000&include_docs=true&filter=_selector`;
+      const url = `${base()}/${TABS[TAB].db}/_changes?feed=longpoll&since=${encodeURIComponent(since)}&timeout=60000&include_docs=true&filter=_selector`;
       const res = await fetch(url, {
         method:'POST',
         headers:{'Content-Type':'application/json'},
@@ -190,7 +209,7 @@ async function watchChanges(q){
       const data = await res.json();
 
       (data.results||[]).forEach(ch => {
-        if(ch.doc && ch.doc.matched_patterns) upsert(ch.doc);
+        if(ch.doc) upsert(ch.doc);
       });
 
       if((data.results||[]).length){
@@ -224,7 +243,7 @@ async function load(q){
     $('#errors').innerHTML =
       `<div class="err">
         Failed to load from CouchDB. ${err.message||err}<br/>
-        Tips: confirm CORS allows <b>https://vikssarate.github.io</b> and the DB <b>${DB_NAME}</b> is public (no admins/members).
+        Tips: confirm CORS allows <b>your GitHub Pages origin</b> and the DB <b>${TABS[TAB].db}</b> is public (no admins/members).
       </div>`;
     $('#list').innerHTML = '';
     $('#count').textContent = '—';
@@ -234,10 +253,28 @@ async function load(q){
 /*** EVENTS ***/
 $('#prev').addEventListener('click', ()=>{ if(PAGE>1){ PAGE--; render(); }});
 $('#next').addEventListener('click', ()=>{ const max=Math.ceil(DATA.length/PAGE_SIZE)||1; if(PAGE<max){ PAGE++; render(); }});
+
 let t=null;
 $('#q').addEventListener('input', e=>{
   clearTimeout(t);
   t = setTimeout(()=> load(e.target.value), 300);
+});
+
+// Tab switching
+document.querySelectorAll('.pill[data-tab]').forEach(el=>{
+  el.addEventListener('click', (e)=>{
+    e.preventDefault();
+    const nextTab = el.getAttribute('data-tab');
+    if (nextTab === TAB) return;
+
+    // toggle active pill
+    document.querySelectorAll('.pill[data-tab]').forEach(p=>p.classList.remove('active'));
+    el.classList.add('active');
+
+    TAB = nextTab;        // switch DB
+    liveToken++;          // cancel any current watcher
+    load($('#q').value.trim());  // reload with current search
+  });
 });
 
 /*** START ***/
